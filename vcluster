@@ -1,0 +1,150 @@
+#!/bin/bash
+
+print_help() {
+    cat <<EOF >&2
+Usage:
+
+$0 init <spark_source>
+$0 start <n>
+$0 stop
+$0 shell
+$0 list
+
+EOF
+}
+
+fail() {
+    echo "$1" >&2
+    exit 1
+}
+
+init() {
+    spark_source="$1"
+    stage_dir=$(mktemp -d)
+
+    [ -n "$spark_source" ] || fail $(print_help)
+    [ -e "$spark_source" ] || fail "No such file or directory: $spark_source"
+
+    # build spark
+    (cd "$spark_source" && ./dev/make-distribution.sh --name custom-spark -Phadoop-2.7)
+    cp -r "$spark_source/dist" "$stage_dir"
+
+    # prepare common docker image
+    cat <<EOF > "$stage_dir/Dockerfile.spark"
+FROM debian:jessie-backports
+
+MAINTAINER Jakob Odersky <jakob@odersky.com>
+
+# install base utilities
+RUN \
+    apt-get update && \
+    apt-get install -y \
+        wget \
+        curl \
+        git \
+	openssl \
+	ssh \
+	openjdk-8-jdk \
+	python \
+	apt-transport-https \
+	nano && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY "$stage_dir"/dist /opt/spark
+
+RUN adduser --system --group --home /run/spark spark
+
+ENV SPARK_LOG_DIR /run/spark
+ENV SPARK_NO_DAEMONIZE true
+
+EXPOSE 6066
+EXPOSE 7077
+EXPOSE 8080
+
+USER spark
+WORKDIR /run/spark
+
+EOF
+    docker build -f "$stage_dir/Dockerfile.spark" -t jodersky/spark:latest "$stage_dir"
+
+    # prepare master docker image
+    cat <<EOF > "$stage_dir/Dockerfile.master"
+FROM jodersky/spark:latest
+MAINTAINER Jakob Odersky <jakob@odersky.com>
+ENTRYPOINT ["/opt/spark/sbin/start-master.sh"]
+
+EOF
+    docker build -f "$stage_dir/Dockerfile.master" -t jodersky/spark-master:latest "$stage_dir"
+
+    # prepare worker docker image
+    cat <<EOF > "$stage_dir/Dockerfile.worker"
+FROM jodersky/spark:latest
+MAINTAINER Jakob Odersky <jakob@odersky.com>
+ENV SPARK_WORKER_DIR /run/spark
+ENTRYPOINT ["/opt/spark/sbin/start-slave.sh"]
+
+EOF
+    docker build -f "$stage_dir/Dockerfile.worker" -t jodersky/spark-worker:latest "$stage_dir"
+}
+
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+	init)
+	    shift
+	    init "$1"
+	    ;;
+	
+	start)
+	    shift
+	    workers="${1:-5}"
+	    docker run \
+		   --label spark=master \
+		   --detach \
+		   jodersky/spark-master
+
+	    cores_total=$(grep -c ^processor /proc/cpuinfo)
+	    cores_worker=$(( (cores_total + workers - 1) / workers)) # round up
+
+	    mem_total=$(cat /proc/meminfo | grep MemTotal | awk '{print $2}') # in kb
+	    mem_worker=$((mem_total / workers))
+
+	    for i in $(seq 1 "$workers"); do
+		docker run \
+		       --label spark=worker \
+		       --detach \
+		       jodersky/spark-worker \
+		       --cores "$cores_worker" \
+		       --memory "$mem_worker"k \
+		       spark://172.17.0.2:7077 
+	    done
+	    ;;
+
+	shell)
+	    docker run \
+		   --label spark=shell \
+		   --interactive \
+		   --tty \
+		   jodersky/spark /opt/spark/bin/spark-shell \
+		   --master=spark://172.17.0.2:7077
+	    ;;
+	
+	stop)
+	    containers=$(docker ps -q --format="{{.ID}}" --filter label=spark)
+	    if [[ -n "$containers" ]]; then
+		docker kill $containers
+		docker rm $containers
+	    fi
+	    ;;
+
+	list)
+	    docker ps -q --format="{{.ID}} {{.Labels}} {{.Command}}" --filter label=spark --no-trunc
+	    ;;
+	
+	help|-h|--help|*)
+	    print_help
+	;;
+    esac
+    shift
+done
